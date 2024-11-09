@@ -76,6 +76,8 @@ PSI.variable_cost(cost::PSY.StorageCost, ::PSI.ActivePowerInVariable, ::PSY.Stor
 
 PSI.get_parameter_multiplier(::EnergyTargetParameter, ::PSY.Storage, ::AbstractStorageFormulation) = 1.0
 PSI.get_parameter_multiplier(::EnergyLimitParameter, ::PSY.Storage, ::AbstractStorageFormulation) = 1.0
+PSI.get_parameter_multiplier(::EnergyTargetTimeSeriesParameter, d::PSY.Storage, ::AbstractStorageFormulation) = PSY.get_storage_capacity(d)
+PSI.get_multiplier_value(::EnergyTargetTimeSeriesParameter, d::PSY.Storage, ::AbstractStorageFormulation) = PSY.get_storage_capacity(d)
 
 ############## ReservationVariable, Storage ####################
 PSI.get_variable_binary(::StorageRegularizationVariable, ::Type{<:PSY.Storage}, ::AbstractStorageFormulation) = false
@@ -95,9 +97,11 @@ end
 
 function PSI.get_default_time_series_names(
     ::Type{D},
-    ::Type{<:Union{PSI.FixedOutput, AbstractStorageFormulation}},
-) where {D <: PSY.Storage}
-    return Dict{Type{<:PSI.TimeSeriesParameter}, String}()
+    ::Type{<:Union{PSI.FixedOutput,AbstractStorageFormulation}},
+) where {D<:PSY.Storage}
+    return Dict{Type{<:PSI.TimeSeriesParameter},String}(
+        EnergyTargetTimeSeriesParameter => "storage_target",
+    )
 end
 
 function PSI.get_default_attributes(
@@ -368,15 +372,21 @@ function PSI.add_variables!(
     T <: Union{StorageEnergyShortageVariable, StorageEnergySurplusVariable},
     U <: PSY.Storage,
 }
+
+    time_steps = PSI.get_time_steps(container)
+
     @assert !isempty(devices)
-    variable = PSI.add_variable_container!(container, T(), U, PSY.get_name.(devices))
+    variable = PSI.add_variable_container!(container, T(), U, PSY.get_name.(devices), time_steps;
+    )
     for d in devices
         name = PSY.get_name(d)
-        variable[name] = JuMP.@variable(
+        for t in time_steps
+            variable[name, t] = JuMP.@variable(
             PSI.get_jump_model(container),
-            base_name = "$(T)_{$(PSY.get_name(d))}",
+                base_name = "$(T)_{$(PSY.get_name(d)), $t}",
             lower_bound = 0.0
         )
+        end
     end
     return
 end
@@ -1250,12 +1260,16 @@ function PSI.add_constraints!(
     container::PSI.OptimizationContainer,
     ::Type{StateofChargeTargetConstraint},
     devices::IS.FlattenIteratorWrapper{V},
-    model::PSI.DeviceModel{V, StorageDispatchWithReserves},
+    model::PSI.DeviceModel{V,StorageDispatchWithReserves},
     network_model::PSI.NetworkModel{X},
-) where {V <: PSY.EnergyReservoirStorage, X <: PM.AbstractPowerModel}
+) where {V<:PSY.EnergyReservoirStorage,X<:PM.AbstractPowerModel}
     energy_var = PSI.get_variable(container, PSI.EnergyVariable(), V)
     surplus_var = PSI.get_variable(container, StorageEnergySurplusVariable(), V)
     shortfall_var = PSI.get_variable(container, StorageEnergyShortageVariable(), V)
+
+    param_container = PSI.get_parameter(container, EnergyTargetTimeSeriesParameter(), V)
+    multiplier =
+        PSI.get_parameter_multiplier_array(container, EnergyTargetTimeSeriesParameter(), V)
 
     device_names, time_steps = axes(energy_var)
     constraint_container = PSI.add_constraints_container!(
@@ -1266,12 +1280,18 @@ function PSI.add_constraints!(
     )
 
     for d in devices
+        ts_keys = PSY.get_time_series_keys(d)
+        if length(ts_keys) > 0
         name = PSY.get_name(d)
-        target = PSY.get_storage_target(d)
+            model = PSI.get_jump_model(container)
+            param = PSI.get_parameter_column_values(param_container, name)
+            for t in time_steps
         constraint_container[name] = JuMP.@constraint(
             PSI.get_jump_model(container),
-            energy_var[name, time_steps[end]] - surplus_var[name] + shortfall_var[name] == target
+                            energy_var[name, t] + shortfall_var[name, t] - surplus_var[name, t] == multiplier[name, t] * param[t]
         )
+            end
+        end
     end
 
     return
@@ -1630,9 +1650,9 @@ end
 function PSI.objective_function!(
     container::PSI.OptimizationContainer,
     devices::IS.FlattenIteratorWrapper{PSY.EnergyReservoirStorage},
-    model::PSI.DeviceModel{PSY.EnergyReservoirStorage, T},
+    model::PSI.DeviceModel{PSY.EnergyReservoirStorage,T},
     ::Type{V},
-) where {T <: AbstractStorageFormulation, V <: PM.AbstractPowerModel}
+) where {T<:AbstractStorageFormulation,V<:PM.AbstractPowerModel}
     PSI.add_variable_cost!(container, PSI.ActivePowerOutVariable(), devices, T())
     PSI.add_variable_cost!(container, PSI.ActivePowerInVariable(), devices, T())
     if PSI.get_attribute(model, "energy_target")
@@ -1698,11 +1718,14 @@ function PSI.add_proportional_cost!(
     U <: PSY.EnergyReservoirStorage,
 }
     variable = PSI.get_variable(container, T(), U)
+    time_steps = PSI.get_time_steps(container)
     for d in devices
+        for t in time_steps
         name = PSY.get_name(d)
         op_cost_data = PSY.get_operation_cost(d)
         cost_term = PSI.proportional_cost(op_cost_data, T(), d, formulation)
-        PSI.add_to_objective_invariant_expression!(container, variable[name] * cost_term)
+            PSI.add_to_objective_invariant_expression!(container, variable[name, t] * cost_term)
+        end
     end
 end
 
