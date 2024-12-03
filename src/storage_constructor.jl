@@ -132,6 +132,7 @@ function _active_power_variables_and_expressions(
     if PSI.get_attribute(model, "energy_target")
         PSI.add_variables!(container, StorageEnergyShortageVariable, devices, U())
         PSI.add_variables!(container, StorageEnergySurplusVariable, devices, U())
+        PSI.add_parameters!(container, EnergyTargetTimeSeriesParameter, devices, model)
     end
 
     if PSI.get_attribute(model, "cycling_limits")
